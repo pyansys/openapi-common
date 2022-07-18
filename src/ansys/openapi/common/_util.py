@@ -3,7 +3,6 @@ import sys
 
 import pyparsing as pp
 from collections import OrderedDict
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from itertools import chain
 from typing import Dict, Union, List, Optional, Tuple, Any, Collection, cast
 

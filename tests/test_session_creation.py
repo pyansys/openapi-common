@@ -2,16 +2,20 @@ import json
 import os
 from functools import wraps
 from urllib.parse import parse_qs
+from contextlib import contextmanager
 
 import pytest
 import requests_mock
 import requests_ntlm
+from requests_auth.testing import token_mock
 
 from ansys.openapi.common import (
     SessionConfiguration,
     ApiClientFactory,
     ApiConnectionException,
 )
+from ansys.openapi.common import _session as session_mod
+from ansys.openapi.common._session import require_oidc
 
 SERVICELAYER_URL = "http://localhost/mi_servicelayer"
 SECURE_SERVICELAYER_URL = "https://localhost/mi_servicelayer"
@@ -23,6 +27,33 @@ REFRESH_TOKEN = (
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIyMzQ1Njc4OTAxIiwibmFtZSI6IkphbmUgU21pdGgiLCJpYXQiOjE"
     "1MTYyMzkwMjJ9.Gm9bqy4CL4_mXKPYrnt2nHGxGM_WaLGpGHrYE_U9uJQ"
 )
+
+
+@require_oidc
+def oidc_noop():
+    return "noop"
+
+
+@contextmanager
+def oidc_status(status):
+    original_status = session_mod._oidc_enabled
+    session_mod._oidc_enabled = status
+    yield
+    session_mod._oidc_enabled = original_status
+
+
+def test_oidc_decorator_oidc_enabled_no_exception():
+    with oidc_status(True):
+        assert oidc_noop() == "noop"
+
+
+def test_oidc_decorator_oidc_not_enabled_exception():
+    with oidc_status(False), pytest.raises(
+        ImportError,
+        match="OpenID Connect features are not enabled. "
+        r"To use them, run `pip install ansys-openapi-common\[oidc\]`",
+    ):
+        oidc_noop()
 
 
 def test_anonymous():
@@ -215,19 +246,40 @@ def test_only_called_once_with_autologon_when_anonymous_is_ok():
         assert m.called_once
 
 
+def test_can_connect_with_oidc_client_credential_flow(token_mock):
+    with requests_mock.Mocker() as m:
+        # eyJleHAiOiAxMDB9 == {"exp": 100} base64 encoded
+        m.post(
+            SERVICELAYER_URL,
+            status_code=200,
+            text=r'{"access_token": "header.eyJleHAiOiAxMDB9.other"}',
+        )
+        m.get(SERVICELAYER_URL, status_code=200)
+
+        factory = ApiClientFactory(SERVICELAYER_URL).with_oidc_client_credentials_flow(
+            "client_id", "client_secret"
+        )
+        factory._ApiClientFactory__test_connection()
+        assert m.call_count == 2  # One POST, one GET
+
+
 def test_can_connect_with_oidc():
     pass
 
 
-def test_only_called_once_with_oidc_when_anonymous_is_ok():
+def test_only_called_once_with_oidc_auth_flow_when_anonymous_is_ok():
     with requests_mock.Mocker() as m:
         m.get(SERVICELAYER_URL, status_code=200)
 
-        _ = ApiClientFactory(SERVICELAYER_URL).with_oidc().authorize()
+        _ = (
+            ApiClientFactory(SERVICELAYER_URL)
+            .with_oidc_authorization_flow()
+            .authorize()
+        )
         assert m.called_once
 
 
-def test_can_connect_with_oidc_using_token():
+def test_can_connect_with_oidc_auth_flow_using_token():
     redirect_uri = "https://www.example.com/login/"
     authority_url = "https://www.example.com/authority/"
     client_id = "b4e44bfa-6b73-4d6a-9df6-8055216a5836"
@@ -281,69 +333,7 @@ def test_can_connect_with_oidc_using_token():
         )
         session = (
             ApiClientFactory(SECURE_SERVICELAYER_URL)
-            .with_oidc()
-            .with_token(refresh_token=refresh_token)
-            .connect()
-        )
-        resp = session.rest_client.get(SECURE_SERVICELAYER_URL)
-        assert resp.status_code == 200
-
-
-def test_can_connect_with_oidc_using_token():
-    redirect_uri = "https://www.example.com/login/"
-    authority_url = "https://www.example.com/authority/"
-    client_id = "b4e44bfa-6b73-4d6a-9df6-8055216a5836"
-    refresh_token = "RrRNWQCQok6sXRn8eAGY4QXus1zq8fk9ZfDN-BeWEmUes"
-    authenticate_header = f'Bearer redirecturi="{redirect_uri}", authority="{authority_url}", clientid="{client_id}"'
-    well_known_response = json.dumps(
-        {
-            "token_endpoint": f"{authority_url}token",
-            "authorization_endpoint": f"{authority_url}authorization",
-        }
-    )
-    token_response = json.dumps(
-        {
-            "access_token": ACCESS_TOKEN,
-            "expires_in": 3600,
-            "refresh_token": refresh_token,
-        }
-    )
-
-    def match_token_request(request):
-        if request.text is None:
-            return False
-        data = parse_qs(request.text)
-        return (
-            data.get("client_id", "") == [client_id]
-            and data.get("grant_type", "") == ["refresh_token"]
-            and data.get("refresh_token", "") == [refresh_token]
-        )
-
-    with requests_mock.Mocker() as m:
-        m.get(
-            f"{authority_url}.well-known/openid-configuration",
-            status_code=200,
-            text=well_known_response,
-        )
-        m.post(
-            f"{authority_url}token",
-            status_code=200,
-            additional_matcher=match_token_request,
-            text=token_response,
-        )
-        m.get(
-            SECURE_SERVICELAYER_URL,
-            status_code=401,
-            headers={"WWW-Authenticate": authenticate_header},
-        )
-        m.get(
-            SECURE_SERVICELAYER_URL,
-            status_code=200,
-            request_headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-        )
-        session = (
-            ApiClientFactory(SECURE_SERVICELAYER_URL)
-            .with_oidc()
+            .with_oidc_authorization_flow()
             .with_token(refresh_token=refresh_token)
             .connect()
         )
@@ -369,20 +359,21 @@ def test_no_autologon_throws():
         assert "Unable to connect with autologon" in str(exception_info.value)
 
 
-def test_no_oidc_throws():
+def test_no_oidc_auth_flow_throws():
     with requests_mock.Mocker() as m:
         m.get(
             SERVICELAYER_URL,
             status_code=401,
             headers={"WWW-Authenticate": 'Basic realm="localhost"'},
         )
-        with pytest.raises(ConnectionError) as exception_info:
+        with pytest.raises(
+            ConnectionError, match="Unable to connect with OpenID Connect"
+        ):
             _ = (
                 ApiClientFactory(SERVICELAYER_URL)
-                .with_oidc()
+                .with_oidc_authorization_flow()
                 .with_token(access_token=ACCESS_TOKEN, refresh_token=REFRESH_TOKEN)
             )
-        assert "Unable to connect with OpenID Connect" in str(exception_info.value)
 
 
 def test_self_signed_throws():

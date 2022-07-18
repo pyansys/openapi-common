@@ -1,6 +1,8 @@
 import os
 import warnings
-from typing import Tuple, Union, Container, Optional, Mapping, TypeVar, Any
+from typing import Tuple, Union, Optional, Mapping, TypeVar, Any, Callable
+from functools import wraps
+from copy import copy
 
 import requests
 from urllib3.util.retry import Retry
@@ -31,7 +33,7 @@ try:
     # noinspection PyUnresolvedReferences
     import requests_auth  # type: ignore[import]
     import keyring
-    from ._oidc import OIDCSessionFactory
+    from ._oidc import OIDCSessionFactory, get_client_credential_auth
 except ImportError:
     _oidc_enabled = False
 
@@ -50,6 +52,29 @@ else:
         _linux_kerberos_enabled = False
 
     _platform_windows = False
+
+Return_Type = TypeVar("Return_Type")
+
+
+def require_oidc(func: Callable[..., Return_Type]) -> Callable[..., Return_Type]:
+    """Enforce that OIDC features are enabled before executing the wrapped function/method.
+
+    Raises
+    ------
+    ImportError
+        If the OIDC features have not been installed.
+    """
+
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Return_Type:
+        if not _oidc_enabled:
+            raise ImportError(
+                "OpenID Connect features are not enabled. To use them, run `pip install ansys-openapi-common[oidc]`."
+            )
+        return func(*args, **kwargs)
+
+    return wrapper
+
 
 # Required to allow the ApiClientFactory to be subclassed. This ensures that Pylance
 # understands that the subclass is returned by the builder methods instead of the base class
@@ -261,11 +286,52 @@ class ApiClientFactory:
                 return self
         raise ConnectionError("Unable to connect with autologon.")
 
-    def with_oidc(
+    @require_oidc
+    def with_oidc_client_credentials_flow(
+        self: Api_Client_Factory,
+        client_id: str,
+        client_secret: str,
+        scope: Optional[str] = "",
+    ) -> Api_Client_Factory:
+        """Set up client authentication for use with OpenID Connect using the Client Credentials flow.
+
+        Parameters
+        ----------
+        client_id : :class:`str`
+            Resource owner username. Provided by the Identity provider.
+        client_secret : :class:`str`
+            Resource owner password. Provided by the Identity provider.
+        scope : Union[:class:`str`, :class:`list`[:class:`str`]], optional
+            Single scope or list of scopes required by the application.
+
+        Returns
+        -------
+        :class:`~ansys.openapi.common.ApiClientFactory`
+            Current client factory object.
+
+        Notes
+        -----
+        OIDC Authentication requires the ``[oidc]`` extra to be installed.
+        """
+
+        auth = get_client_credential_auth(
+            token_url=self._api_url,
+            client_id=client_id,
+            client_secret=client_secret,
+            scope=scope,
+            session=copy(self._session),
+        )
+        self._session.auth = auth
+        self._configured = True
+        return self
+
+    @require_oidc
+    def with_oidc_authorization_flow(
         self,
         idp_session_configuration: Optional[SessionConfiguration] = None,
-    ) -> "OIDCSessionBuilder":
-        """Set up client authentication for use with OpenID Connect.
+    ) -> "AuthorizationSessionBuilder":
+        """Set up client authentication for use with OpenID Connect using the authorization flow. Currently
+        only authorization flow with PKCE is supported.
 
         Parameters
         ----------
@@ -274,20 +340,17 @@ class ApiClientFactory:
 
         Returns
         -------
-        :class:`~ansys.openapi.common.OIDCSessionBuilder`
+        :class:`~ansys.openapi.common.AuthorizationSessionBuilder`
             Builder object to authenticate via OIDC.
 
         Notes
         -----
         OIDC Authentication requires the ``[oidc]`` extra to be installed.
         """
-        if not _oidc_enabled:
-            raise ImportError(
-                "OpenID Connect features are not enabled. To use them, run `pip install ansys-openapi-common[oidc]`."
-            )
+
         initial_response = self._session.get(self._api_url)
         if self.__handle_initial_response(initial_response):
-            return OIDCSessionBuilder(self)
+            return AuthorizationSessionBuilder(self)
 
         session_factory = OIDCSessionFactory(
             self._session,
@@ -296,7 +359,7 @@ class ApiClientFactory:
             idp_session_configuration,
         )
 
-        return OIDCSessionBuilder(self, session_factory)
+        return AuthorizationSessionBuilder(self, session_factory)
 
     def __test_connection(self) -> bool:
         """Attempt to connect to the API server. If this returns a 2XX status code, the method returns
@@ -380,9 +443,9 @@ class ApiClientFactory:
         return parse_authenticate(response.headers["www-authenticate"])
 
 
-class OIDCSessionBuilder:
-    """Helps create OpenID Connect sessions from different types of input and provides OIDC-specific
-    configuration options.
+class AuthorizationSessionBuilder:
+    """Helps create OpenID Connect Authorize Flow sessions from different types of input and provides
+    configuration options specific to the Authorization Flow.
 
     Parameters
     ----------
